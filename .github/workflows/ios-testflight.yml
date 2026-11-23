@@ -1,0 +1,82 @@
+# Сборка AR Quest для iPhone и отправка в TestFlight.
+# Сам проект игры лежит в приватном репозитории: архив Xcode-проекта берётся из его релиза xcode-latest
+# по токену только для чтения. Здесь нет кода игры и ключей — только эта инструкция.
+# Секреты (Settings → Secrets and variables → Actions):
+#   SOURCE_REPO_TOKEN, APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8
+name: iOS → TestFlight
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Xcode 26
+        run: |
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)
+          [ -n "$X" ] || { echo "::error::На машине нет Xcode 26"; exit 1; }
+          sudo xcode-select -s "$X/Contents/Developer"; xcodebuild -version
+
+      - name: Проект Xcode из релиза
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          gh release download xcode-latest -R anpok1990-commits/arquest-ios -p 'xcode.zip' -D "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/xcode.zip" -d "$RUNNER_TEMP/proj"
+          P=$(dirname "$(find "$RUNNER_TEMP/proj" -maxdepth 3 -name 'Unity-iPhone.xcodeproj' | head -1)")
+          [ -n "$P" ] || { echo "::error::В архиве нет Unity-iPhone.xcodeproj"; exit 1; }
+          # архив сделан на Windows: у скриптов пропадает право на запуск, возвращаем
+          find "$P" -type f \( -name '*.sh' -o -name 'MapFileParser' -o -name 'usymtool*' -o -name 'il2cpp*' \) -exec chmod +x {} + || true
+          echo "PROJ=$P" >> "$GITHUB_ENV"
+
+      - name: Ключ App Store Connect
+        env:
+          P: ${{ secrets.ASC_KEY_P8 }}
+          K: ${{ secrets.ASC_KEY_ID }}
+          I: ${{ secrets.ASC_ISSUER_ID }}
+          T: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          [ -n "$P" ] && [ -n "$K" ] && [ -n "$I" ] && [ -n "$T" ] || { echo "::error::Не заданы секреты"; exit 1; }
+          K=$(printf '%s' "$K" | tr -d '[:space:]'); I=$(printf '%s' "$I" | tr -d '[:space:]'); T=$(printf '%s' "$T" | tr -d '[:space:]')
+          printf '%s\n' "$P" | tr -d '\r' > "$RUNNER_TEMP/asc.p8"
+          grep -q 'BEGIN PRIVATE KEY' "$RUNNER_TEMP/asc.p8" || { echo "::error::ASC_KEY_P8 не похож на ключ"; exit 1; }
+          echo "::add-mask::$K"; echo "::add-mask::$I"; echo "::add-mask::$T"
+          { echo "ASC_K=$K"; echo "ASC_I=$I"; echo "ASC_T=$T"; echo "ASC_P8=$RUNNER_TEMP/asc.p8"; } >> "$GITHUB_ENV"
+
+      - name: Сборка (архив)
+        run: |
+          set -o pipefail
+          cd "$PROJ"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" Info.plist
+          xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" archive \
+            DEVELOPMENT_TEAM="$ASC_T" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -60
+          # архив без подписи: подписывает Apple при отправке (облачный сертификат),
+          # поэтому каждая сборка больше не создаёт новый сертификат разработчика
+
+      - name: Отправка в TestFlight
+        run: |
+          set -o pipefail
+          cat > "$RUNNER_TEMP/export.plist" <<PL
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$ASC_T</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PL
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_P8" -authenticationKeyID "$ASC_K" -authenticationKeyIssuerID "$ASC_I" > "$RUNNER_TEMP/export.log" 2>&1 && RC=0 || RC=$?
+          tail -40 "$RUNNER_TEMP/export.log"
+          if [ "$RC" != 0 ]; then
+            # подробности отказа Apple лежат в отдельной папке журналов
+            L=$(ls -dt "${TMPDIR:-/tmp}"/*.xcdistributionlogs 2>/dev/null | head -1)
+            [ -n "$L" ] && grep -rhiE "error|fail|not found|no suitable|agreement|forbidden|unauthor" "$L" | cut -c1-600 | tail -40
+            exit "$RC"
+          fi
